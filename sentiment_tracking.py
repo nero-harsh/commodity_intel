@@ -1,161 +1,202 @@
-
-import akshare as ak
+import ssl
+import urllib3
+import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# Your local AI setup
+# Disable SSL Warnings for Chinese APIs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+old_request = requests.Session.request
+def new_request(self, method, url, **kwargs):
+    kwargs['verify'] = False
+    return old_request(self, method, url, **kwargs)
+requests.Session.request = new_request
+
+# Configuration
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "qwen3.5:9b" # Or "qwen2.5:7b" / "deepseek-r1:7b" based on what you downloaded
+MODEL_NAME = "qwen3.5:9b"
 
-def get_silver_price():
-    """Fetches Silver prices with a Western Fallback if China blocks you"""
-    print("📊 Fetching live Silver Futures data...")
-    
-    # Attempt 1: Shanghai Futures Exchange (Chinese Domestic Price)
+# Define target commodities, global tickers, and Chinese keywords
+COMMODITIES = {
+    "Silver": {
+        "ticker": "SI=F", 
+        "keywords":["白银", "光伏", "太阳能", "新能源车"]
+    },
+    "Gold": {
+        "ticker": "GC=F", 
+        "keywords":["黄金", "金价", "美联储", "避险", "央行"]
+    },
+    "Copper": {
+        "ticker": "HG=F", 
+        "keywords":["期铜", "沪铜", "房地产", "电网", "基建"]
+    },
+    "Aluminum": {
+        "ticker": "ALI=F", 
+        "keywords": ["沪铝", "电解铝", "有色金属", "产能"]
+    }
+}
+
+def get_historical_technicals(ticker):
+    """Fetches 1-year historical data and calculates moving averages."""
     try:
-        df_ag = ak.futures_zh_daily_sina(symbol="ag0")
-        latest_price = df_ag.iloc[-1]['close']
-        prev_price = df_ag.iloc[-2]['close']
-        pct_change = ((latest_price - prev_price) / prev_price) * 100
+        asset = yf.Ticker(ticker)
+        hist = asset.history(period="1y")
         
-        print(f"✅ SUCCESS: SHFE Silver Price: {latest_price} CNY/kg ({pct_change:.2f}% today)")
-        return latest_price, pct_change
-    except Exception as e:
-        print(f"⚠️ Sina blocked the request. Falling back to Global COMEX Silver...")
-        
-        # Attempt 2: Global COMEX Silver Futures via Yahoo Finance (Unhackable Fallback)
-        try:
-            silver = yf.Ticker("SI=F")
-            hist = silver.history(period="2d")
-            latest_price = hist.iloc[-1]['Close']
-            prev_price = hist.iloc[-2]['Close']
-            pct_change = ((latest_price - prev_price) / prev_price) * 100
+        if hist.empty:
+            return "No historical data available."
             
-            print(f"✅ SUCCESS: COMEX Silver Price: ${latest_price:.2f} USD/oz ({pct_change:.2f}% today)")
-            return latest_price, pct_change
-        except Exception as e_yf:
-            print(f"❌ All price fetches failed: {e_yf}")
-            return 0, 0
+        current_price = hist['Close'].iloc[-1]
+        sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+        sma_200 = hist['Close'].rolling(window=200).mean().iloc[-1]
+        
+        # Determine technical trend
+        if current_price > sma_50 and sma_50 > sma_200:
+            trend = "Strong Uptrend (Price > 50 SMA > 200 SMA)"
+        elif current_price < sma_50 and sma_50 < sma_200:
+            trend = "Strong Downtrend (Price < 50 SMA < 200 SMA)"
+        else:
+            trend = "Consolidating / Mixed Trend"
+            
+        return f"Current Price: {current_price:.2f}. Trend: {trend}. 50-Day MA: {sma_50:.2f}, 200-Day MA: {sma_200:.2f}."
+    except Exception as e:
+        return f"Error fetching historical data: {str(e)}"
 
-def get_macro_news():
-    """Fetches news prioritizing Eastmoney (stable) over Sina (unstable)"""
-    print("\n📡 Fetching latest macro news...")
+def get_global_news(ticker):
+    """Fetches recent global news headlines using Yahoo Finance."""
+    try:
+        asset = yf.Ticker(ticker)
+        news_items = asset.news
+        headlines = [item['title'] for item in news_items[:3]] # Keep top 3 to save LLM context
+        if not headlines:
+            return "No recent global news."
+        return " | ".join(headlines)
+    except Exception:
+        return "Global news unavailable."
+
+def get_chinese_macro_news():
+    """Aggregates latest news from Eastmoney and Cailianshe."""
+    news_list =[]
     
-    # Attempt 1: Eastmoney (Usually doesn't block international IPs)
     try:
-        print("Trying Eastmoney (em)...")
-        df_news = ak.stock_info_global_em()
-        df_news = df_news.rename(columns={'标题': 'title', '内容': 'content'})
-        if not df_news.empty:
-            return df_news
-    except: pass
+        df_em = ak.stock_info_global_em()
+        if not df_em.empty:
+            df_em = df_em.rename(columns={'标题': 'title', '内容': 'content'})
+            news_list.append(df_em)
+    except Exception:
+        pass
 
-    # Attempt 2: Cailianshe (Premium wire)
     try:
-        print("Trying Cailianshe (cls)...")
-        df_news = ak.stock_info_global_cls(symbol="全部")
-        df_news = df_news.rename(columns={'标题': 'title', '内容': 'content'})
-        if not df_news.empty:
-            return df_news
-    except: pass
+        df_cls = ak.stock_info_global_cls(symbol="全部")
+        if not df_cls.empty:
+            df_cls = df_cls.rename(columns={'标题': 'title', '内容': 'content'})
+            news_list.append(df_cls)
+    except Exception:
+        pass
 
-    # Attempt 3: Sina (Last resort since they block SSL)
-    try:
-        print("Trying Sina Finance...")
-        df_news = ak.stock_info_global_sina()
-        return df_news
-    except:
-        print("❌ All Chinese News APIs are currently blocking your IP.")
+    if not news_list:
         return pd.DataFrame()
+        
+    combined_df = pd.concat(news_list, ignore_index=True)
+    return combined_df
 
-def analyze_news_with_llm(news_text, commodity="Silver"):
-    """Passes the text to the Local Reasoning LLM"""
+def analyze_commodity_with_llm(commodity, technicals, chinese_news, global_news):
+    """Sends aggregated data to the LLM for a single, comprehensive analysis."""
     prompt = f"""
-    You are a senior commodities analyst based in Shanghai. 
-    Read the following breaking news translated from Chinese: 
-    "{news_text}"
+    You are a professional commodities quantitative researcher. Analyze the following combined data for {commodity}.
+
+    1. 1-YEAR TECHNICAL TREND:
+    {technicals}
+
+    2. RECENT CHINESE MACROECONOMIC NEWS (Translated context required):
+    {chinese_news}
+
+    3. RECENT GLOBAL NEWS:
+    {global_news}
+
+    Synthesize the technical momentum, Chinese industrial/macro demand, and global news into a definitive forecast.
     
-    Analyze how this macroeconomic or industrial news affects the price of {commodity}.
-    Consider supply constraints, solar panel demand, EV manufacturing, or PBOC monetary policy.
-    
-    You must reply in EXACTLY this format:
-    SIGNAL: [BULLISH, BEARISH, or NEUTRAL]
-    REASONING:[1 sentence explaining the economic logic]
+    You must reply strictly in the following format:
+    SIGNAL:[BULLISH, BEARISH, or NEUTRAL]
+    REASONING:[Provide a professional, 2 to 3 sentence justification integrating the historical trend with the fundamental news drivers.]
     """
     
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
-        "stream": False
+        "stream": False,
+        "options": {
+            "temperature": 0.2 # Lower temperature for strictly analytical, non-creative responses
+        }
     }
     
     try:
         response = requests.post(OLLAMA_API_URL, json=payload, verify=False)
-        output = response.json()['response']
+        output = response.json().get('response', '')
         
-        signal = "NEUTRAL"
-        if "BULLISH" in output.upper(): signal = "BULLISH"
-        elif "BEARISH" in output.upper(): signal = "BEARISH"
-            
-        reasoning = output.split("REASONING:")[-1].strip() if "REASONING:" in output else output.strip()
+        signal_line = [line for line in output.split('\n') if 'SIGNAL:' in line]
+        reasoning_line = [line for line in output.split('\n') if 'REASONING:' in line]
+        
+        signal = signal_line[0].replace('SIGNAL:', '').strip() if signal_line else "NEUTRAL"
+        reasoning = reasoning_line[0].replace('REASONING:', '').strip() if reasoning_line else output.strip()
+        
         return signal, reasoning
     except Exception as e:
-        return "NEUTRAL", f"LLM Error: Ensure Ollama is running in your terminal. ({e})"
+        return "ERROR", str(e)
 
-def run_pro_pipeline():
-    # 1. Get Quantitative Market Data
-    price, pct_change = get_silver_price()
+def main():
+    print("--------------------------------------------------")
+    print("COMMODITY MACRO FORECASTING SYSTEM")
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("--------------------------------------------------")
     
-    # 2. Fetch News
-    df_news = get_macro_news()
-
-    if df_news.empty:
-        print("\nExiting pipeline: No news available.")
-        return
-
-    # Filter for Silver/Macro keywords
-    keywords =["白银", "光伏", "新能源", "央行", "降息", "美联储"] # Silver, Solar, EV, PBOC, Rate Cut, Fed
-    pattern = '|'.join(keywords)
+    print("[INFO] Fetching aggregate Chinese macro news...")
+    df_chinese_news = get_chinese_macro_news()
     
-    # Check if 'content' or 'title' exists in the dataframe
-    search_col = 'content' if 'content' in df_news.columns else df_news.columns[1]
-    df_silver = df_news[df_news[search_col].astype(str).str.contains(pattern, na=False)].head(5)
-
-    if df_silver.empty:
-        print("No macro news affecting silver found right now.")
-        return
-
-    bull_score = 0
-    print(f"\n🧠 AI Analyzing {len(df_silver)} Economic Drivers...")
+    search_col = 'content' if 'content' in df_chinese_news.columns else (df_chinese_news.columns[1] if not df_chinese_news.empty else None)
     
-    for _, row in df_silver.iterrows():
-        text = str(row[search_col])
-        signal, reasoning = analyze_news_with_llm(text, "Silver")
+    results =[]
+
+    for commodity, data in COMMODITIES.items():
+        print(f"\n[INFO] Processing data for {commodity}...")
         
-        if signal == "BULLISH": bull_score += 1
-        elif signal == "BEARISH": bull_score -= 1
-            
-        print(f"\nNews: {text[:80]}...")
-        print(f"Signal: {signal}")
-        print(f"Logic:  {reasoning}")
+        # 1. Get Technicals
+        technicals = get_historical_technicals(data["ticker"])
+        
+        # 2. Get Global News
+        global_news = get_global_news(data["ticker"])
+        
+        # 3. Filter Chinese News
+        chinese_context = "No relevant Chinese news found today."
+        if not df_chinese_news.empty and search_col:
+            pattern = '|'.join(data["keywords"])
+            filtered_news = df_chinese_news[df_chinese_news[search_col].astype(str).str.contains(pattern, na=False)].head(3)
+            if not filtered_news.empty:
+                chinese_context = " | ".join(filtered_news[search_col].astype(str).tolist())
+        
+        # 4. LLM Inference
+        print(f"[INFO] Executing LLM inference for {commodity}...")
+        signal, reasoning = analyze_commodity_with_llm(commodity, technicals, chinese_context, global_news)
+        
+        results.append({
+            "Commodity": commodity,
+            "Signal": signal,
+            "Reasoning": reasoning,
+            "Technicals": technicals.split('.')[1].strip() if '.' in technicals else technicals
+        })
 
-    # 3. Final Synthesis Strategy
-    print("\n" + "="*50)
-    print("🎯 DAILY QUANTITATIVE & FUNDAMENTAL SYNTHESIS")
-    print("="*50)
-    print(f"Current Price Change: {pct_change:.2f}%")
+    # Print Final Professional Report
+    print("\n\n" + "="*80)
+    print("FINAL COMMODITY FORECAST REPORT")
+    print("="*80)
     
-    if bull_score > 0 and pct_change > 0:
-        print("🚨 STRONG BUY: News is Bullish AND Price is confirming the trend.")
-    elif bull_score < 0 and pct_change < 0:
-        print("🚨 STRONG SELL: News is Bearish AND Price is dropping.")
-    elif bull_score > 0 and pct_change < 0:
-        print("⚠️ WATCH: News is Bullish but Price is dropping (Market has not priced in the news yet).")
-    elif bull_score < 0 and pct_change > 0:
-        print("⚠️ WATCH: News is Bearish but Price is rising (Potential irrational exuberance).")
-    else:
-        print("⚖️ HOLD: Mixed signals or neutral market.")
+    for res in results:
+        print(f"COMMODITY : {res['Commodity']}")
+        print(f"SIGNAL    : {res['Signal']}")
+        print(f"TREND     : {res['Technicals']}")
+        print(f"REASONING : {res['Reasoning']}")
+        print("-" * 80)
 
 if __name__ == "__main__":
-    run_pro_pipeline()
+    main()
