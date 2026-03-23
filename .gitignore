@@ -1,3 +1,5 @@
 venv/
 commodity_news_analysis.csv
 forecast_log.txt
+commodity_data_matrix.csv
+forecast_reasoning_log.txt
